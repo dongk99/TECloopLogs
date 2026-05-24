@@ -216,7 +216,7 @@ def main() -> int:
                     log(f"loaded {len(sensors)} sensors from sensors.json")
 
                 new_iso, new_dt = parse_started(schedule_path)
-                if new_iso != started_iso:
+                if new_iso is not None and new_iso != started_iso:
                     log(f"session changed: {started_iso} -> {new_iso}")
                     started_iso, started_dt = new_iso, new_dt
                     position = 0
