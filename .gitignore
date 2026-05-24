@@ -1,0 +1,13 @@
+# Binaries and shortcuts not part of TEC pipeline code
+claude.exe
+*.lnk
+_elev_test.txt
+
+# Subfolders that aren't TEC pipeline code
+.claude/
+classifier_pdf/
+
+# Generated logs from one-time registration scripts
+register_occt_autolaunch_task.log
+register_occt_snapshot_task.log
+*.log
