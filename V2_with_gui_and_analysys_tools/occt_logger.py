@@ -1,0 +1,1112 @@
+#!/usr/bin/env python3
+r"""occt_logger.py -- SELF-CONTAINED replacement for occt_bin_tail.py (new-spec output).
+
+Does the original gist task natively (no dependency on occt_bin_tail, so retiring
+that live logger at cutover cannot break this): decode OCCT v17 sensorpoints.bin
+(block = int32 count, count*(int32 sensor_id, f64 elapsed_s, f64 value), uint32
+crc32) -> map ids via sensors.json -> schedule_execution.json Started + elapsed =
+wall-clock UTC. THEN, on top: average each sensor over 0.5 s windows, format at the
+spec sig-fig rules, route to component, append wide rows to per-component daily CSVs
+(D:\occt_history\<COMP>_DATA\<COMP>_MMDDYYYY.csv).
+
+Decode helpers (open_shared_rb, structs, read_block, sensors.json/schedule parsing,
+abbreviation map) are sliced VERBATIM from the proven occt_bin_tail.py by the
+assembler; the 0.5 s windowing is percore_extract's normalize()/_average_window().
+
+Coolant/peltier is a SEPARATE stream (logs before/independent of OCCT) -> fuse at
+analysis time on wall-clock, not here. GUI (spec section 1) still pending.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import csv
+import datetime
+import json
+import math
+import os
+import re
+import sqlite3
+import struct
+import sys
+import time
+import zlib
+from pathlib import Path
+from typing import BinaryIO
+
+
+if sys.platform == "win32":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _CreateFileW = ctypes.windll.kernel32.CreateFileW
+    _CreateFileW.restype = wintypes.HANDLE
+    _CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    _GENERIC_READ = 0x80000000
+    _FILE_SHARE_RWD = 0x1 | 0x2 | 0x4
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def open_shared_rb(path):
+        h = _CreateFileW(
+            str(path), _GENERIC_READ, _FILE_SHARE_RWD,
+            None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
+        )
+        if h is None or h == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error() or ctypes.GetLastError()
+            raise OSError(err, f"CreateFileW failed (err={err}): {path}")
+        fd = msvcrt.open_osfhandle(h, os.O_RDONLY | os.O_BINARY)
+        return os.fdopen(fd, "rb")
+else:
+    def open_shared_rb(path):
+        return open(path, "rb")
+
+STATE_DIR = Path(os.environ.get("TEMP", r"C:\Users\dongk\AppData\Local\Temp")) / "OCCT" / "State"
+LOG_DIR = Path(r"D:\occt_history")
+DB_PATH = LOG_DIR / "occt_samples.db"
+POLL_INTERVAL_SEC = 0.25
+BUSY_TIMEOUT_MS = 5000
+
+COUNT_STRUCT = struct.Struct("<i")
+CRC_STRUCT = struct.Struct("<I")
+POINT_STRUCT = struct.Struct("<idd")
+
+UNIT_LABELS_INT = {
+    0: "", 100: "C", 200: "V", 300: "W", 400: "A",
+    500: "RPM", 600: "MHz", 700: "%", 701: "MB", 702: "MB/s", 800: "",
+}
+UNIT_LABELS_STR = {
+    "Celsius": "C", "Volt": "V", "Watt": "W", "Ampere": "A",
+    "Rpm": "RPM", "MHz": "MHz", "Percent": "%",
+    "MB": "MB", "MBs": "MB/s", "Default": "", "Other": "",
+}
+
+# --- abbreviation map ------------------------------------------------------
+
+_SPECIALS: dict[str, str] = {
+    "Virtual Memory Committed": "VM_Commit",
+    "Virtual Memory Available": "VM_Avail",
+    "Virtual Memory Load": "VM_Load",
+    "Physical Memory Used": "PM_Used",
+    "Physical Memory Available": "PM_Avail",
+    "Physical Memory Load": "PM_Load",
+    "Page File Usage": "PF_Usage",
+    "Page File Total": "PF_Total",
+    "Page File Used": "PF_Used",
+    "CPU (Tctl/Tdie)": "CPU_Tctl",
+    "CPU Die (average)": "CPU_DieAvg",
+    "CPU CCD1 (Tdie)": "CCD1_Tdie",
+    "CPU IOD Hotspot": "IOD_Hot",
+    "CPU IOD Average": "IOD_Avg",
+    "CPU VDDCR_VDD VRM (SVI3 TFN)": "VDDCR_VDD_TVRM",
+    "CPU VDDCR_SOC VRM (SVI3 TFN)": "VDDCR_SOC_TVRM",
+    "CPU VDD_MISC VRM (SVI3 TFN)": "VDD_MISC_TVRM",
+    "Motherboard": "MB_T",
+    "Auxiliary": "MB_Aux_T",
+    "CPU (PECI)": "MB_PECI_T",
+    "PCH TSI0": "PCH_T",
+    "SMBus TS0": "SMB_TS0_T",
+    "T14": "T14",
+    "MOS": "MOS_T",
+    "Power Stage Max": "VRM_PS_T",
+    "PWM Controller": "VRM_PWM_T",
+    "GPU Temperature": "GPU_T",
+    "GPU Memory Junction Temperature": "GPU_MemJ_T",
+    "GPU Hot Spot Temperature": "GPU_Hot_T",
+    "GPU Thermal Limit": "GPU_TLim",
+    "Drive Temperature": "Drv_T",
+    "Drive Temperature 2": "Drv_T2",
+    "Drive Temperature 3": "Drv_T3",
+    "SPD Hub Temperature": "SPD_T",
+    "CPU VDDCR_VDD Voltage (SVI3 TFN)": "VDDCR_VDD_V",
+    "CPU VDDCR_SOC Voltage (SVI3 TFN)": "VDDCR_SOC_V",
+    "CPU VDD_MISC Voltage (SVI3 TFN)": "VDD_MISC_V",
+    "Vcore": "Vcore",
+    "+12V": "+12V",
+    "+5V": "+5V",
+    "+1.8V": "+1.8V",
+    "+3.3V (AVCC)": "+3.3V_AVCC",
+    "+3.3V (3VCC)": "+3.3V_3VCC",
+    "+1.05_ALW": "+1.05_ALW",
+    "3VSB": "3VSB",
+    "VBAT": "VBAT",
+    "VTT": "VTT",
+    "DRAM": "DRAM",
+    "VHIF": "VHIF",
+    "3VCC": "3VCC",
+    "AVSB": "AVSB",
+    "VDDCR_SOC": "VDDCR_SOC_MB",
+    "VDD_MISC": "VDD_MISC_MB",
+    "VDD (SWA) Voltage": "VDD_SWA_V",
+    "VDDQ (SWB) Voltage": "VDDQ_SWB_V",
+    "VPP (SWC) Voltage": "VPP_SWC_V",
+    "1.8V VOUT Voltage": "1.8V_OUT",
+    "1.0V VOUT Voltage": "1.0V_OUT",
+    "VIN Voltage": "MEM_VIN",
+    "VR VOUT": "VR_VOUT",
+    "VR VIN": "VR_VIN",
+    "GPU Core Voltage": "GPU_CoreV",
+    "GPU FBVDD Input Voltage": "GPU_FBVDD_V",
+    "GPU PCIe +12V Input Voltage": "GPU_PCIe12V",
+    "GPU 12VHPWR Voltage": "GPU_HPWR_V",
+    "CPU Package Power": "CPU_Pkg_P",
+    "CPU Core Power (SVI3 TFN)": "CPU_Core_P",
+    "CPU SoC Power (SVI3 TFN)": "CPU_SoC_P",
+    "Core+SoC+MISC Power (SVI3 TFN)": "CPU_Tot_P",
+    "CPU PPT": "CPU_PPT",
+    "Power (POUT)": "VRM_POUT",
+    "Power (Input)": "VRM_PIN",
+    "Total Power": "MEM_TotP",
+    "GPU Power": "GPU_P",
+    "GPU Core (NVVDD) Input Power (sum)": "GPU_NVVDD_Pin",
+    "GPU FBVDD Input Power": "GPU_FBVDD_Pin",
+    "GPU PCIe +12V Input Power": "GPU_PCIe_Pin",
+    "GPU 12VHPWR Power": "GPU_HPWR_P",
+    "GPU Input PP Source Power (sum)": "GPU_PPSrc_P",
+    "GPU Core (NVVDD) Output Power": "GPU_NVVDD_Pout",
+    "GPU Power Limit (rated)": "GPU_PLim_rat",
+    "GPU Power Limit (max)": "GPU_PLim_max",
+    "Total GPU Power [% of TDP]": "GPU_P_TDP",
+    "Total GPU Power (normalized) [% of TDP]": "GPU_PN_TDP",
+    "CPU Core Current (SVI3 TFN)": "CPU_Core_I",
+    "SoC Current (SVI3 TFN)": "CPU_SoC_I",
+    "CPU TDC": "CPU_TDC",
+    "CPU EDC": "CPU_EDC",
+    "MISC Current (SVI3 TFN)": "CPU_MISC_I",
+    "Current (IOUT)": "VRM_IOUT",
+    "Current (IIN)": "VRM_IIN",
+    "CPU1": "CPU_Fan1",
+    "CPU2": "CPU_Fan2",
+    "MOS Fan1": "MOS_Fan",
+    "Bus Clock": "Bus_Clk",
+    "Average Effective Clock": "Avg_EClk",
+    "Memory Clock": "Mem_Clk",
+    "Infinity Fabric Clock (FCLK)": "FCLK",
+    "Memory Controller Clock (UCLK)": "UCLK",
+    "Frequency Limit - Global": "Freq_GLim",
+    "GPU Clock": "GPU_Clk",
+    "GPU Memory Clock": "GPU_MClk",
+    "GPU Video Clock": "GPU_VClk",
+    "GPU Effective Clock": "GPU_EClk",
+    "GPU Crossbar Clock": "GPU_XBClk",
+    "Max CPU/Thread Usage": "MaxThr_U",
+    "Total CPU Usage": "CPU_U",
+    "Total CPU Utility": "CPU_Util",
+    "Package C6 Residency": "Pkg_C6",
+    "CPU PPT Limit": "PPT_Lim",
+    "CPU TDC Limit": "TDC_Lim",
+    "CPU EDC Limit": "EDC_Lim",
+    "CPU PPT FAST Limit": "PPT_F_Lim",
+    "Thermal Limit": "T_Lim",
+    "GPU Core Load": "GPU_Load",
+    "GPU Memory Controller Load": "GPU_MCLoad",
+    "GPU Video Engine Load": "GPU_VELoad",
+    "GPU Bus Load": "GPU_BusLoad",
+    "GPU Memory Usage": "GPU_MUsage",
+    "GPU D3D Usage": "GPU_D3D",
+    "GPU Video Decode 0 Usage": "GPU_VD0",
+    "GPU VR Usage": "GPU_VR",
+    "GPU Memory Available": "GPU_MAvail",
+    "GPU Memory Allocated": "GPU_MAlloc",
+    "GPU D3D Memory Dedicated": "GPU_D3D_Ded",
+    "GPU D3D Memory Dynamic": "GPU_D3D_Dyn",
+    "Drive Remaining Life": "Drv_Life",
+    "Drive Available Spare": "Drv_Spare",
+    "Drive Failure": "Drv_Fail",
+    "Drive Warning": "Drv_Warn",
+    "Read Activity": "R_Act",
+    "Write Activity": "W_Act",
+    "Total Activity": "T_Act",
+    "Read Rate": "R_Rate",
+    "Write Rate": "W_Rate",
+    "Read Total": "R_Tot",
+    "Write Total": "W_Tot",
+    "Total Host Writes": "Host_W",
+    "Total Host Reads": "Host_R",
+    "PMIC High Temperature": "PMIC_HT",
+    "PMIC Over Voltage": "PMIC_OV",
+    "PMIC Under Voltage": "PMIC_UV",
+    "Memory Clock Ratio": "MclkR",
+    "Tcas": "tCAS",
+    "Trcd": "tRCD",
+    "Trp": "tRP",
+    "Tras": "tRAS",
+    "Trc": "tRC",
+    "Trfc": "tRFC",
+    "Command Rate": "CR",
+    "Thermal Throttling (HTC)": "HTC_TT",
+    "Thermal Throttling (PROCHOT CPU)": "PROCHOT_CPU",
+    "Thermal Throttling (PROCHOT EXT)": "PROCHOT_EXT",
+    "DRAM Read Bandwidth": "DRAM_R_BW",
+    "DRAM Write Bandwidth": "DRAM_W_BW",
+    "Average Active Core Count": "AvgActC",
+    "Chassis Intrusion": "ChIntr",
+    "VRM Efficiency": "VRM_Eff",
+    "Receiver Errors": "RcvErr",
+    "Replay Count": "Replay",
+    "Replay Rollover Count": "ReplayRoll",
+    "Bad DLLP Count": "BadDLLP",
+    "Bad TLP Count": "BadTLP",
+    "LCRC Error Count": "LCRC_Err",
+    "NAKs Sent Count": "NAKSent",
+    "NAKs Received Count": "NAKRcv",
+    "Recovery Count": "RecCnt",
+    "Correctable Error Count": "CorrErr",
+    "Non-Fatal Error Count": "NFErr",
+    "Fatal Error Count": "FErr",
+    "Unsupported Request Count": "URC",
+    "PCIe Link Speed": "PCIe_LS",
+    "Performance Limit - Power": "PLim_Pow",
+    "Performance Limit - Thermal": "PLim_T",
+    "Performance Limit - Reliability Voltage": "PLim_RV",
+    "Performance Limit - Max Operating Voltage": "PLim_MOV",
+    "Performance Limit - Utilization": "PLim_Util",
+    "Performance Limit - SLI GPUBoost Sync": "PLim_SLI",
+    "Total DL": "Net_DL",
+    "Total UP": "Net_UP",
+    "Current DL rate": "Net_DLr",
+    "Current UP rate": "Net_UPr",
+    "Total Errors": "Net_Err",
+}
+
+_RE_CORE_CCD = re.compile(r"^Core(\d+) \(CCD1\)$")
+_RE_CORE_TX_ECLK = re.compile(r"^Core (\d+) T(\d+) Effective Clock$")
+_RE_CORE_TX_USAGE = re.compile(r"^Core (\d+) T(\d+) Usage$")
+_RE_CORE_TX_UTIL = re.compile(r"^Core (\d+) T(\d+) Utility$")
+_RE_CORE_CX_RES = re.compile(r"^Core (\d+) C(\d+) Residency$")
+_RE_CORE_POWER = re.compile(r"^Core (\d+) Power$")
+_RE_CORE_VID = re.compile(r"^Core (\d+) VID$")
+_RE_CORE_RATIO = re.compile(r"^Core (\d+) Ratio$")
+_RE_CORE_CLK = re.compile(r"^Core (\d+) Clock")
+_RE_AUXTIN = re.compile(r"^AUXTIN(\d+)$")
+_RE_CHIPSET = re.compile(r"^Chipset (\d+) \(xHCI\)$")
+_RE_PCIE_LANE = re.compile(r"^PCIe Lane (\d+) Errors$")
+_RE_GPU_VE = re.compile(r"^GPU Video Encode (\d+) Usage$")
+_RE_VIN = re.compile(r"^VIN(\d+)$")
+
+
+def _abbreviate_one(name: str, sensor: dict) -> str:
+    """Apply pattern rules to produce a short name (pre-dedupe)."""
+    if name == "L3 Cache (CCD1)":
+        cls = sensor.get("Class", "")
+        if cls == "Temperature":
+            return "L3_T"
+        if cls == "Frequency":
+            return "L3_Clk"
+        return "L3"
+
+    if name in ("GPU Fan1", "GPU Fan2"):
+        cls = sensor.get("Class", "")
+        base = "GPU_Fan" + name[-1]
+        return base if cls == "Fan" else f"{base}_pct"
+
+    if name == "CPU":
+        return "MB_CPU_T"
+
+    m = _RE_CORE_CCD.match(name)
+    if m:
+        return f"C{m.group(1)}_T"
+    m = _RE_CORE_TX_ECLK.match(name)
+    if m:
+        return f"C{m.group(1)}_T{m.group(2)}_EClk"
+    m = _RE_CORE_TX_USAGE.match(name)
+    if m:
+        return f"C{m.group(1)}_T{m.group(2)}_U"
+    m = _RE_CORE_TX_UTIL.match(name)
+    if m:
+        return f"C{m.group(1)}_T{m.group(2)}_Util"
+    m = _RE_CORE_CX_RES.match(name)
+    if m:
+        return f"C{m.group(1)}_C{m.group(2)}res"
+    m = _RE_CORE_POWER.match(name)
+    if m:
+        return f"C{m.group(1)}_P"
+    m = _RE_CORE_VID.match(name)
+    if m:
+        return f"C{m.group(1)}_VID"
+    m = _RE_CORE_RATIO.match(name)
+    if m:
+        return f"C{m.group(1)}_R"
+    m = _RE_CORE_CLK.match(name)
+    if m:
+        return f"C{m.group(1)}_Clk"
+    m = _RE_AUXTIN.match(name)
+    if m:
+        return f"AUX{m.group(1)}_T"
+    m = _RE_CHIPSET.match(name)
+    if m:
+        return f"CS{m.group(1)}_T"
+    m = _RE_PCIE_LANE.match(name)
+    if m:
+        return f"PCIeL{m.group(1)}_Err"
+    m = _RE_GPU_VE.match(name)
+    if m:
+        return f"GPU_VE{m.group(1)}"
+    m = _RE_VIN.match(name)
+    if m:
+        return f"VIN{m.group(1)}"
+
+    if name in _SPECIALS:
+        return _SPECIALS[name]
+
+    # Fallback: strip parens, replace whitespace, truncate
+    short = re.sub(r"\s*\(.*?\)\s*", "_", name).strip("_")
+    short = re.sub(r"\s+", "_", short)
+    return short[:24] or f"S{sensor.get('SensorId', '?')}"
+
+
+def build_abbrev_map(sensors: dict[int, dict]) -> dict[int, str]:
+    """Compute sensor_id -> abbreviation. Disambiguate collisions with _{id}."""
+    raw: dict[int, str] = {}
+    for sid, sensor in sensors.items():
+        name = sensor.get("Name", f"S{sid}")
+        raw[sid] = _abbreviate_one(name, sensor)
+    counts: dict[str, int] = {}
+    for s in raw.values():
+        counts[s] = counts.get(s, 0) + 1
+    return {
+        sid: (f"{s}_{sid}" if counts[s] > 1 else s)
+        for sid, s in raw.items()
+    }
+
+
+def to_us(dt: datetime.datetime) -> int:
+    return int(dt.timestamp() * 1_000_000)
+
+
+def load_json(path: Path):
+    with path.open("r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def load_sensors(path: Path) -> dict[int, dict]:
+    data = load_json(path)
+    if not isinstance(data, list):
+        return {}
+    out: dict[int, dict] = {}
+    for item in data:
+        if isinstance(item, dict) and "SensorId" in item:
+            out[int(item["SensorId"])] = item
+    return out
+
+
+def parse_started(path: Path) -> tuple[str | None, datetime.datetime | None]:
+    if not path.exists():
+        return None, None
+    try:
+        data = load_json(path)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict) or not data.get("Started"):
+        return None, None
+    started = str(data["Started"])
+    try:
+        dt = datetime.datetime.fromisoformat(started)
+    except ValueError:
+        return None, None
+    if dt.year <= 1:
+        return None, None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    dt = dt.astimezone(datetime.timezone.utc)
+    return dt.isoformat(), dt
+
+
+def unit_label(sensor: dict) -> str:
+    raw = sensor.get("ReadingUnit", "")
+    if isinstance(raw, int):
+        return UNIT_LABELS_INT.get(raw, str(raw))
+    if isinstance(raw, str):
+        return UNIT_LABELS_STR.get(raw, raw)
+    return ""
+
+
+def read_exact(handle: BinaryIO, size: int) -> bytes | None:
+    data = handle.read(size)
+    return data if len(data) == size else None
+
+
+def read_block(handle: BinaryIO, validate_crc: bool) -> list[tuple[int, float, float]] | None:
+    block_start = handle.tell()
+    count_bytes = read_exact(handle, COUNT_STRUCT.size)
+    if count_bytes is None:
+        handle.seek(block_start)
+        return None
+    (count,) = COUNT_STRUCT.unpack(count_bytes)
+    if count < 0 or count > 1_000_000:
+        raise ValueError(f"invalid point count {count} at offset {block_start}")
+    records_bytes = read_exact(handle, count * POINT_STRUCT.size)
+    crc_bytes = read_exact(handle, CRC_STRUCT.size) if records_bytes is not None else None
+    if records_bytes is None or crc_bytes is None:
+        handle.seek(block_start)
+        return None
+    expected_crc = CRC_STRUCT.unpack(crc_bytes)[0]
+    actual_crc = zlib.crc32(count_bytes + records_bytes) & 0xFFFFFFFF
+    if validate_crc and expected_crc != actual_crc:
+        raise ValueError(f"CRC mismatch at offset {block_start}")
+    points: list[tuple[int, float, float]] = []
+    offset = 0
+    for _ in range(count):
+        points.append(POINT_STRUCT.unpack_from(records_bytes, offset))
+        offset += POINT_STRUCT.size
+    return points
+
+
+def wait_for(path: Path, label: str) -> None:
+    announced = False
+    while not path.exists():
+        if not announced:
+            log(f"waiting for {label}: {path}")
+            announced = True
+        time.sleep(POLL_INTERVAL_SEC * 4)
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}", flush=True)
+
+
+LOG_DIR = r"D:\occt_history"
+COMPONENTS = ("CPU", "GPU", "RAM", "STORAGE", "MB")  # spec's 5; "Other"-tagged sensors are dropped
+WINDOW_US = 500_000  # 0.5 s normalization window (percore_extract)
+PELTIER_LOG = r"C:\Users\dongk\Desktop\Peltierlog\peltier.log"
+COOLANT_TOL_US = 4_000_000  # coolant cell = peltier reading whose PC-arrival is within +/-4 s of the window, else BLANK
+
+
+# ---------------------------------------------------------------- sig figs
+def round_sig(x: float, n: int) -> str:
+    """n significant figures, no scientific notation, no trailing-zero pad."""
+    if x == 0:
+        return "0"
+    if not math.isfinite(x):
+        return repr(x)
+    exp = math.floor(math.log10(abs(x)))
+    decimals = max(0, n - 1 - exp)
+    s = f"{x:.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+TIMING_SECONDARY = {"Trc", "Trfc"}                               # 3 sig fig
+TIMING_PRIMARY = {"Tcas", "Trcd", "Trp", "Tras", "Command Rate"}  # 2 sig fig
+
+
+def sigfig_digits(full_name: str, cls: str, unit_label: str) -> int:
+    """Spec sig-fig count. NAME -> CLASS -> UNIT -> default(6)."""
+    if full_name in TIMING_SECONDARY:
+        return 3
+    if full_name in TIMING_PRIMARY:
+        return 2
+    if cls == "Voltage":
+        return 4
+    if cls == "Power":
+        return 5
+    if cls == "Current":
+        return 5
+    if cls == "Fan":
+        return 4
+    if cls == "Frequency":   # clock (MHz)
+        return 6
+    if cls == "Usage":       # percentages
+        return 4
+    if unit_label == "%":
+        return 4
+    if unit_label == "MB":   # RAM usage in MB
+        return 6
+    return 6                 # all else incl. Temperature: 6 sig fig maximum
+
+
+def format_value(value: float, full_name: str, cls: str, unit_label: str) -> str:
+    return round_sig(value, sigfig_digits(full_name, cls, unit_label))
+
+
+# ---------------------------------------------------------------- routing
+DEVICE_TO_COMPONENT = {
+    "Cpu": "CPU", "Gpu": "GPU", "Memory": "RAM",
+    "Storage": "STORAGE", "Motherboard": "MB",
+}
+# EDITABLE inference for DeviceType=="Other": first substring match wins.
+OTHER_ROUTING = [
+    ("Memory", "RAM"), ("Page File", "RAM"), ("DRAM", "RAM"),
+    ("Tcas", "RAM"), ("Trcd", "RAM"), ("Trp", "RAM"), ("Tras", "RAM"),
+    ("Trfc", "RAM"), ("Trc", "RAM"), ("Command Rate", "RAM"),
+    ("VR ", "MB"), ("VRM", "MB"), ("PWM", "MB"), ("Power Stage", "MB"),
+    ("Power (Input)", "MB"), ("Power (POUT)", "MB"),
+    ("Current (IIN)", "MB"), ("Current (IOUT)", "MB"),
+    ("Total DL", "OTHER"), ("Total UP", "OTHER"),
+    ("Current DL", "OTHER"), ("Current UP", "OTHER"), ("Total Errors", "OTHER"),
+]
+DEFAULT_OTHER_COMPONENT = "OTHER"
+
+
+def route_component(full_name: str, device_type: str) -> str:
+    comp = DEVICE_TO_COMPONENT.get(device_type)
+    if comp:
+        return comp
+    for pat, c in OTHER_ROUTING:
+        if pat in full_name:
+            return c
+    return DEFAULT_OTHER_COMPONENT
+
+
+# ---------------------------------------------------------------- windowing
+# Verbatim logic from percore_extract.py (structural snapshots -> 0.5 s windows).
+def iter_snapshots(rows):
+    """rows: ordered (wall_time_us, sensor_id, value). Yield (snap_wt, {sid: val}).
+    Snapshot boundary = next occurrence of an already-seen sensor_id."""
+    snap, snap_wt = {}, None
+    for wt, sid, val in rows:
+        if sid in snap:
+            yield snap_wt, snap
+            snap, snap_wt = {}, None
+        if snap_wt is None:
+            snap_wt = wt
+        snap[sid] = val
+    if snap:
+        yield snap_wt, snap
+
+
+def _average_window(buf):
+    """buf: list of (snap_wt, snap). Return (rep_wt, {sid: mean}, win_start, win_end)."""
+    sums, counts, wt_sum = {}, {}, 0
+    for snap_wt, snap in buf:
+        wt_sum += snap_wt
+        for sid, val in snap.items():
+            if val is None:
+                continue
+            sums[sid] = sums.get(sid, 0.0) + val
+            counts[sid] = counts.get(sid, 0) + 1
+    avg = {sid: sums[sid] / counts[sid] for sid in sums}
+    return round(wt_sum / len(buf)), avg, buf[0][0], buf[-1][0]
+
+
+def windows(rows, window_us=WINDOW_US):
+    """Yield (rep_wt, {sid: mean}, win_start, win_end)."""
+    buf, start = [], None
+    for snap_wt, snap in iter_snapshots(rows):
+        if start is not None and snap_wt - start > window_us:
+            yield _average_window(buf)
+            buf, start = [], None
+        if start is None:
+            start = snap_wt
+        buf.append((snap_wt, snap))
+    if buf:
+        yield _average_window(buf)
+
+
+# ---------------------------------------------------------------- metadata
+def meta_from_db(conn):
+    """sid -> {short, full, class, device_type, unit} from occt_samples.db sensors."""
+    out = {}
+    for sid, short, full, cls, dt, unit in conn.execute(
+            "SELECT sensor_id, short_name, full_name, class, device_type, unit FROM sensors"):
+        out[sid] = {"short": short, "full": full, "class": cls or "",
+                    "device_type": dt or "", "unit": unit or ""}
+    return out
+
+
+def meta_from_state(state_dir):
+    """Live metadata from OCCT sensors.json (reuses occt_bin_tail helpers)."""
+    import pathlib
+    sensors = load_sensors(pathlib.Path(state_dir) / "sensors.json")
+    abbrev = build_abbrev_map(sensors)
+    out = {}
+    for sid, s in sensors.items():
+        out[sid] = {"short": abbrev.get(sid, f"S{sid}"),
+                    "full": s.get("Name", f"Sensor {sid}"),
+                    "class": s.get("Class", ""),
+                    "device_type": s.get("DeviceType", ""),
+                    "unit": unit_label(s)}
+    return out
+
+
+def component_columns(meta, sel):
+    """SELECTED component -> sorted short_names routed to it (only comps in `sel`).
+    CPU additionally gets a trailing 'coolant_c' column (the CPU coolant-loop temp)."""
+    cols = {c: [] for c in sel}
+    for m in meta.values():
+        comp = route_component(m["full"], m["device_type"])
+        if comp in cols:
+            cols[comp].append(m["short"])
+    out = {c: sorted(set(v)) for c, v in cols.items()}
+    if "CPU" in out:
+        out["CPU"] = out["CPU"] + ["coolant_c"]
+    return out
+
+
+def transform_window(avg, meta, sel):
+    """Averaged window {sid: mean} -> {component: {short_name: formatted_str}}.
+    Only components in `sel` are produced."""
+    per_comp = {}
+    for sid, val in avg.items():
+        m = meta.get(sid)
+        if m is None:
+            continue
+        comp = route_component(m["full"], m["device_type"])
+        if comp not in sel:
+            continue
+        cell = format_value(val, m["full"], m["class"], m["unit"])
+        per_comp.setdefault(comp, {})[m["short"]] = cell
+    return per_comp
+
+
+def iso_utc(wt_us):
+    return datetime.datetime.fromtimestamp(wt_us / 1e6, datetime.timezone.utc)
+
+
+# ---------------------------------------------------------------- wide writer
+class WideWriter:
+    """Per-component daily wide CSVs with UTC-day rollover."""
+
+    def __init__(self, out_root, cols):
+        self.out_root = out_root
+        self.cols = cols
+        self.open = {}  # comp -> (date, fh, writer)
+
+    def _writer(self, comp, day):
+        cur = self.open.get(comp)
+        if cur and cur[0] == day:
+            return cur[2]
+        if cur:
+            cur[1].close()
+        d = os.path.join(self.out_root, f"{comp}_DATA")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{comp}_{day.strftime('%m%d%Y')}.csv")
+        is_new = not os.path.exists(path)
+        fh = open(path, "a", newline="", encoding="utf-8")
+        w = csv.writer(fh)
+        if is_new:
+            w.writerow(["wall_time_utc"] + self.cols[comp])
+            fh.flush()
+        self.open[comp] = (day, fh, w)
+        return w
+
+    def write_window(self, rep_wt, per_comp):
+        dt = iso_utc(rep_wt)
+        day, iso = dt.date(), dt.isoformat()
+        for comp, columns in self.cols.items():
+            if not columns:
+                continue
+            cells = per_comp.get(comp, {})
+            row = [iso] + [cells.get(s, "") for s in columns]
+            self._writer(comp, day).writerow(row)
+
+    def flush(self):
+        for _, fh, _ in self.open.values():
+            fh.flush()
+
+    def close(self):
+        for _, fh, _ in self.open.values():
+            fh.close()
+        self.open.clear()
+
+
+# ---------------------------------------------------------------- coolant feed
+class CoolantFeed:
+    """Align peltier coolant to OCCT by REAL PC WALL-CLOCK -- the only clock the two
+    devices share. Each new coolant line is stamped with the PC time when it is READ
+    (arrival ~= when PuTTY wrote it ~= when the reading happened). The peltier device's
+    own elapsed counter is IGNORED: it free-runs and drifts (~90 s / 6 h vs the PC
+    clock, measured). OCCT windows are on the PC clock too (verified: track the wall
+    clock within the ~2 s window-close lag), so matching by PC arrival time aligns the
+    two streams to within ~a poll interval (1-2 s) -- the precision floor for two
+    un-synced free-running clocks, well under how fast a coolant loop moves; tighter
+    needs a hardware timestamp on the sensor (the future MB-sensor plan). at() returns
+    None -> BLANK when no coolant arrived near the query time (PuTTY silent)."""
+    _HDR = re.compile(r"PuTTY log \d{4}\.\d{2}\.\d{2}")
+    _DAT = re.compile(r"\d{2}:\d{2}:\d{2},(-?\d+(?:\.\d+)?)")
+
+    def __init__(self, path, tol_us=COOLANT_TOL_US, keep=4000):
+        self.path, self.tol_us, self.keep = path, tol_us, keep
+        try:
+            self.offset = os.path.getsize(path)   # skip history; stamp only newly-arriving lines
+        except OSError:
+            self.offset = 0
+        self.times, self.temps = [], []           # (PC-arrival us, temp)
+        self.prev_size, self.last_grow = -1, 0.0
+
+    def poll(self, now_us=None):
+        if now_us is None:
+            now_us = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1_000_000)
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return
+        if self.prev_size >= 0 and size > self.prev_size:
+            self.last_grow = time.time()
+        self.prev_size = size
+        if size < self.offset:
+            self.offset = 0
+        if time.time() - self.last_grow > 3.0:
+            return
+        try:
+            with open_shared_rb(self.path) as f:   # FILE_SHARE_WRITE: must NOT lock out PuTTY's writes
+                f.seek(self.offset)
+                data = f.read()
+                self.offset = f.tell()
+        except OSError:
+            return
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            if self._HDR.search(line):
+                continue
+            m = self._DAT.search(line)
+            if m is None:
+                continue
+            try:
+                temp = float(m.group(1))
+            except ValueError:
+                continue
+            self.times.append(now_us)             # stamp with PC arrival time (the shared clock)
+            self.temps.append(temp)
+        if len(self.times) > self.keep:
+            self.times, self.temps = self.times[-self.keep:], self.temps[-self.keep:]
+
+    def at(self, t_us):
+        """Coolant temp whose PC-arrival time is nearest t_us within tol_us, else None."""
+        if not self.times:
+            return None
+        i = bisect.bisect_left(self.times, t_us)
+        best = None
+        for j in (i - 1, i):
+            if 0 <= j < len(self.times):
+                d = abs(self.times[j] - t_us)
+                if d <= self.tol_us and (best is None or d < best[0]):
+                    best = (d, self.temps[j])
+        return best[1] if best else None
+
+
+# ---------------------------------------------------------------- replay self-test
+def replay(source_db, percore_db, session_id, out_root, selected=None):
+    """Run the transform over one session from occt_samples.db, write wide CSVs,
+    and verify against percore's core_samples (windowing parity + rounding)."""
+    import sqlite3
+    selected = set(selected or COMPONENTS)
+    src = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+    meta = meta_from_db(src)
+    cols = component_columns(meta, selected)
+    print(f"selected={sorted(selected)}  columns/component={ {c: len(cols[c]) for c in cols} }")
+
+    # short-name lookup for cores 0-7 (Core{i} (CCD1) -> e.g. C0_T)
+    core_short = {}
+    for m in meta.values():
+        for i in range(8):
+            if m["full"] == f"Core{i} (CCD1)":
+                core_short[i] = m["short"]
+
+    rows = src.execute(
+        "SELECT wall_time_us, sensor_id, value FROM samples "
+        "WHERE session_id = ? ORDER BY wall_time_us", (session_id,))
+
+    writer = WideWriter(out_root, cols)
+    my_core = {}  # (wt, core) -> formatted cell
+    n_win = 0
+    sample_cells = []
+    for rep_wt, avg, _ws, _we in windows(rows):
+        per_comp = transform_window(avg, meta, selected)
+        writer.write_window(rep_wt, per_comp)
+        cpu = per_comp.get("CPU", {})
+        for i, short in core_short.items():
+            if short in cpu:
+                my_core[(rep_wt, i)] = cpu[short]
+        if n_win < 3:
+            sample_cells.append((rep_wt, {k: cpu.get(core_short.get(k, ""), "") for k in range(8)}))
+        n_win += 1
+    writer.flush(); writer.close(); src.close()
+    print(f"windows written: {n_win}")
+
+    # regression: my windowed+rounded core temps must equal round_sig(percore temp, 6).
+    # Match windows by NEAREST rep_wt (<=50ms): percore times its windows off ~76
+    # target sensors, this logger off all 429, so rep_wt differs by a few ms.
+    import bisect
+    pc = sqlite3.connect(f"file:{percore_db}?mode=ro", uri=True)
+    exp_by_wt = {}
+    for wt, core, temp in pc.execute(
+            "SELECT wall_time_us, core, temp_c FROM core_samples WHERE session_id = ?",
+            (session_id,)):
+        exp_by_wt.setdefault(wt, {})[core] = temp
+    pc.close()
+    my_by_wt = {}
+    for (wt, core), cell in my_core.items():
+        my_by_wt.setdefault(wt, {})[core] = cell
+    my_wts = sorted(my_by_wt)
+    TOL_US = 50_000
+    checked = mism = unmatched = 0
+    examples = []
+    for pwt in sorted(exp_by_wt):
+        i = bisect.bisect_left(my_wts, pwt)
+        cands = ([my_wts[i]] if i < len(my_wts) else []) + ([my_wts[i - 1]] if i > 0 else [])
+        if not cands or min(abs(w - pwt) for w in cands) > TOL_US:
+            unmatched += 1
+            continue
+        mwt = min(cands, key=lambda w: abs(w - pwt))
+        for core, temp in exp_by_wt[pwt].items():
+            want = round_sig(temp, 6)
+            got = my_by_wt[mwt].get(core)
+            checked += 1
+            if got != want:
+                mism += 1
+                if len(examples) < 6:
+                    examples.append((pwt, mwt, core, got, want, temp))
+    print(f"regression vs percore core_samples (nearest-wt<={TOL_US}us): "
+          f"checked={checked} matches={checked - mism} mismatches={mism} "
+          f"unmatched_pc_windows={unmatched}")
+    for pwt, mwt, core, got, want, raw in examples:
+        print(f"   MISMATCH p_wt={pwt} my_wt={mwt} core{core}: got {got!r} want {want!r} (raw {raw})")
+
+    print("doomstack-fix check (first windows, core temps as written to CSV):")
+    for wt, cells in sample_cells:
+        present = {f"core{k}": v for k, v in cells.items() if v != ""}
+        print(f"   {iso_utc(wt).isoformat()}  {present}")
+    return checked, mism
+
+
+# ---------------------------------------------------------------- settings window
+SELECTION_FILE = os.path.join(LOG_DIR, ".occt_logger_selection.json")
+
+
+def load_saved_selection():
+    try:
+        with open(SELECTION_FILE, encoding="utf-8") as f:
+            return set(c for c in json.load(f) if c in COMPONENTS)
+    except (OSError, ValueError):
+        return set()
+
+
+def save_selection(sel):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(SELECTION_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(sel), f)
+    except OSError:
+        pass
+
+
+def settings_window(points_path):
+    """Spec section 1/1.1 startup window. Returns the selected component set once
+    the gate passes (OCCT bin GROWING and a selection exists), with a 15 s
+    auto-proceed on the saved selection. Returns None if closed without selecting."""
+    import tkinter as tk
+    saved = load_saved_selection()
+    root = tk.Tk()
+    root.title("OCCT logger - pick components to measure")
+    cvars = {}
+    for c in COMPONENTS:
+        v = tk.BooleanVar(value=(c in saved))
+        cvars[c] = v
+        tk.Checkbutton(root, text=c, variable=v).pack(anchor="w", padx=14)
+    status = tk.Label(root, text="waiting for OCCT...", fg="gray")
+    status.pack(padx=14, pady=4)
+    st = {"sel": None, "prev": -1, "detect_t": None, "growing": False, "last_grow_t": 0.0,
+          "p_prev": -1, "p_grow_t": 0.0}
+
+    def chosen():
+        return {c for c, v in cvars.items() if v.get()}
+
+    def finish():
+        # section 1 gate: do NOT close / start until the bin is GROWING, peltier.log is being
+        # written (both -> st["growing"]), AND a selection exists
+        if not st["growing"]:
+            status.config(text="waiting: need OCCT bin AND peltier.log both writing", fg="red")
+            return
+        s = chosen()
+        if s:
+            save_selection(s)
+            st["sel"] = s
+            root.destroy()
+
+    tk.Button(root, text="Start logging", command=finish).pack(pady=6)
+
+    def poll():
+        now = time.time()
+        # gate A: OCCT sensorpoints.bin growing (spec section 1)
+        try:
+            size = os.path.getsize(points_path)
+        except OSError:
+            size = 0
+        if st["prev"] >= 0 and size > st["prev"]:
+            st["last_grow_t"] = now
+        st["prev"] = size
+        bin_active = (now - st["last_grow_t"]) < 3.0       # latched: mutes red flicker
+        # gate B: peltier.log being actively written (~1 Hz; same 3 s latch) -- added per user
+        try:
+            p_size = os.path.getsize(PELTIER_LOG)
+        except OSError:
+            p_size = -1
+        if st["p_prev"] >= 0 and p_size > st["p_prev"]:
+            st["p_grow_t"] = now
+        st["p_prev"] = p_size
+        pelt_active = (now - st["p_grow_t"]) < 3.0         # latched: mutes red flicker
+        # window closes only when BOTH streams are live (selection enforced in finish)
+        active = bin_active and pelt_active
+        st["growing"] = active
+        if active:
+            status.config(text="OCCT + peltier.log detected", fg="green")
+            if st["detect_t"] is None:
+                st["detect_t"] = now
+            if chosen() and now - st["detect_t"] >= 15:    # 15 s auto-proceed (section 1.1)
+                finish()
+                return
+        elif not bin_active:
+            status.config(text="OCCT Monitoring only not detected", fg="red")
+            st["detect_t"] = None
+        else:
+            status.config(text="peltier.log not being written", fg="red")
+            st["detect_t"] = None
+        root.after(500, poll)
+
+    root.after(500, poll)
+    root.mainloop()
+    return st["sel"]
+
+
+# ---------------------------------------------------------------- live tail
+def live_main(args, sel):
+    """Headless tail loop, same structure as occt_bin_tail.main but new sink.
+    UNTESTED against live OCCT this session (OCCT not running). The transform it
+    drives is the one verified by --replay."""
+    import pathlib
+    state_dir = STATE_DIR
+    wait_for(state_dir, "OCCT State directory")
+    sensors_path = state_dir / "sensors.json"
+    points_path = state_dir / "sensorpoints.bin"
+    schedule_path = state_dir / "schedule_execution.json"
+    wait_for(sensors_path, "sensors.json")
+    wait_for(points_path, "sensorpoints.bin")
+
+    meta = meta_from_state(str(state_dir))
+    cols = component_columns(meta, sel)
+    writer = WideWriter(LOG_DIR, cols)
+    coolant = CoolantFeed(PELTIER_LOG)
+    _, started_dt = parse_started(schedule_path)
+    position = points_path.stat().st_size  # new sessions start at end
+    pending = []           # ordered (wt, sid, val) not yet in a committed window
+    committed_until = -1   # rep_wt of last written window
+    validate = not args.no_crc
+    log(f"occt_logger live: {len(meta)} sensors -> {LOG_DIR}\\*_DATA")
+
+    try:
+        while True:
+            if not peltier_gate_open():
+                log(f"GATE CLOSED: peltier log idle >{PELTIER_GATE_WINDOW_SEC}s; exiting.")
+                break
+            try:
+                size = points_path.stat().st_size
+                if size < position:
+                    position = 0
+                with open_shared_rb(points_path) as h:
+                    h.seek(position)
+                    while True:
+                        bp = h.tell()
+                        try:
+                            block = read_block(h, validate_crc=validate)
+                        except ValueError:
+                            position = h.tell(); break
+                        if block is None:
+                            position = bp; break
+                        for sid, elapsed_s, value in block:
+                            if started_dt is not None:
+                                wt = to_us(started_dt + datetime.timedelta(seconds=elapsed_s))
+                            else:
+                                wt = to_us(datetime.datetime.now(datetime.timezone.utc))
+                            pending.append((wt, sid, value))
+                        position = h.tell()
+
+                coolant.poll()   # stamp newly-arrived coolant lines with PC arrival time (every iteration)
+                # commit windows that are definitely closed (a full window has elapsed since)
+                if pending:
+                    latest = pending[-1][0]
+                    closeable = [r for r in pending if r[0] <= latest - WINDOW_US]
+                    if closeable:
+                        for rep_wt, avg, _ws, we in windows(iter(closeable)):
+                            if rep_wt <= committed_until:
+                                continue
+                            per = transform_window(avg, meta, sel)
+                            if "CPU" in sel:
+                                c = coolant.at(rep_wt)   # match by PC wall-clock; blank if no coolant near this window
+                                per.setdefault("CPU", {})["coolant_c"] = round_sig(c, 6) if c is not None else ""
+                            writer.write_window(rep_wt, per)
+                            committed_until = rep_wt
+                        writer.flush()
+                        # retain only rows newer than the last closed window boundary
+                        pending = [r for r in pending if r[0] > latest - WINDOW_US]
+            except FileNotFoundError:
+                time.sleep(POLL_INTERVAL_SEC * 4)
+            except Exception as e:  # noqa: BLE001
+                log(f"occt_logger error: {e}")
+                time.sleep(POLL_INTERVAL_SEC * 4)
+            if args.once:
+                break
+            time.sleep(POLL_INTERVAL_SEC)
+    finally:
+        writer.close()
+
+
+PELTIER_GATE_DIR = r"C:\Users\dongk\Desktop\Peltierlog"
+PELTIER_GATE_WINDOW_SEC = 30
+
+
+def peltier_gate_open():
+    """Launch gate: True only if a peltier log (*.log/*.txt) in PELTIER_GATE_DIR
+    was modified within PELTIER_GATE_WINDOW_SEC seconds (live sensor session
+    actively writing peltier.log). Fail-closed: no dir / no recent write -> False."""
+    newest = 0.0
+    try:
+        for name in os.listdir(PELTIER_GATE_DIR):
+            if name.lower().endswith((".log", ".txt")):
+                try:
+                    mt = os.path.getmtime(os.path.join(PELTIER_GATE_DIR, name))
+                    if mt > newest:
+                        newest = mt
+                except OSError:
+                    pass
+    except OSError:
+        return False
+    return newest > 0.0 and (time.time() - newest) <= PELTIER_GATE_WINDOW_SEC
+
+
+def main():
+    ap = argparse.ArgumentParser(description="OCCT per-component sig-fig logger (replaces occt_bin_tail).")
+    ap.add_argument("--replay", type=int, metavar="SESSION",
+                    help="self-test: replay one session from occt_samples.db, verify vs percore")
+    ap.add_argument("--source-db", default=None)
+    ap.add_argument("--percore-db", default=None)
+    ap.add_argument("--out", default=None, help="output root (default D:\\occt_history)")
+    ap.add_argument("--components", nargs="*", default=None,
+                    help="components to log (default all 5: CPU GPU RAM STORAGE MB)")
+    ap.add_argument("--no-crc", action="store_true")
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args()
+
+    if args.replay is not None:
+        base = (r"C:\Users\dongk\.claude\projects\TEC research shit make subfolders here"
+                r"\percore_extract")
+        source = args.source_db or (base + r"\source_copies\occt_samples.db")
+        percore = args.percore_db or (base + r"\extracted.sqlite")
+        out = args.out or os.path.join(os.environ.get("TEMP", "."), "occt_logger_replay")
+        os.makedirs(out, exist_ok=True)
+        print(f"REPLAY session {args.replay}  source={source}\n  out={out}\n")
+        replay(source, percore, args.replay, out, selected=set(args.components) if args.components else None)
+        return 0
+
+    if not peltier_gate_open():
+        print(f"GATE CLOSED: no peltier log written within {PELTIER_GATE_WINDOW_SEC}s; not launching.")
+        return 0
+
+    if args.components:
+        sel = set(args.components)                  # headless: explicit selection, no window
+    else:
+        sel = settings_window(STATE_DIR / "sensorpoints.bin")   # spec section 1 window
+        if not sel:
+            print("no selection made; exiting.")
+            return 0
+    return live_main(args, sel) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

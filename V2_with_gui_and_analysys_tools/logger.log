@@ -1,0 +1,2 @@
+[2026-06-27T03:54:18] occt_logger live: 429 sensors -> D:\occt_history\*_DATA
+[2026-06-27T03:55:05] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin

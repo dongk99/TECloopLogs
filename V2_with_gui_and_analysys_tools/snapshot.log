@@ -1,0 +1,56 @@
+[2026-06-13T21:52:33] === snapshot starting ===
+[2026-06-13T21:52:33] OCCT State is empty - nothing to snapshot
+[2026-06-13T22:10:37] === snapshot starting ===
+[2026-06-13T22:10:37] OCCT State is empty - nothing to snapshot
+[2026-06-13T23:47:35] === snapshot starting ===
+[2026-06-13T23:47:35] OCCT State is empty - nothing to snapshot
+[2026-06-14T06:39:49] === snapshot starting ===
+[2026-06-14T06:39:49] OCCT State is empty - nothing to snapshot
+[2026-06-14T23:37:04] === snapshot starting ===
+[2026-06-14T23:37:04] Snapshot destination: D:\occt_history\snapshots\session_2026-06-14_233704
+[2026-06-14T23:37:04]   moved schedule_execution.json (9640 bytes)
+[2026-06-14T23:37:18]   moved sensorpoints.bin (527108900 bytes)
+[2026-06-14T23:37:18]   moved sensors.json (209618 bytes)
+[2026-06-14T23:37:18]   moved sysinfo.json (118313 bytes)
+[2026-06-14T23:37:18] Snapshot complete: 4 items archived to D:\occt_history\snapshots\session_2026-06-14_233704
+[2026-06-15T00:05:23] === snapshot starting ===
+[2026-06-15T00:05:23] Snapshot destination: D:\occt_history\snapshots\session_2026-06-15_000523
+[2026-06-15T00:05:23]   moved schedule_execution.json (9640 bytes)
+[2026-06-15T00:05:23]   moved sensorpoints.bin (8596372 bytes)
+[2026-06-15T00:05:23]   moved sensors.json (265080 bytes)
+[2026-06-15T00:05:23]   moved sysinfo.json (118413 bytes)
+[2026-06-15T00:05:23] Snapshot complete: 4 items archived to D:\occt_history\snapshots\session_2026-06-15_000523
+[2026-06-15T12:29:32] === snapshot starting ===
+[2026-06-15T12:29:32] OCCT State is empty - nothing to snapshot
+[2026-06-15T12:36:03] === snapshot starting ===
+[2026-06-15T12:36:03] OCCT State is empty - nothing to snapshot
+[2026-06-16T01:25:36] === snapshot starting ===
+[2026-06-16T01:25:36] OCCT State is empty - nothing to snapshot
+[2026-06-16T00:17:45] === snapshot starting ===
+[2026-06-16T00:17:45] OCCT State is empty - nothing to snapshot
+[2026-06-16T00:04:55] === snapshot starting ===
+[2026-06-16T00:04:55] OCCT State is empty - nothing to snapshot
+[2026-06-16T04:46:17] === snapshot starting ===
+[2026-06-16T04:46:17] OCCT State is empty - nothing to snapshot
+[2026-06-16T04:44:59] === snapshot starting ===
+[2026-06-16T04:44:59] OCCT State is empty - nothing to snapshot
+[2026-06-17T00:05:41] === snapshot starting ===
+[2026-06-17T00:05:41] OCCT State is empty - nothing to snapshot
+[2026-06-18T09:22:23] === snapshot starting ===
+[2026-06-18T09:22:23] OCCT State is empty - nothing to snapshot
+[2026-06-18T10:01:46] === snapshot starting ===
+[2026-06-18T10:01:46] OCCT State is empty - nothing to snapshot
+[2026-06-18T10:05:14] === snapshot starting ===
+[2026-06-18T10:05:14] OCCT State is empty - nothing to snapshot
+[2026-06-19T02:49:48] === snapshot starting ===
+[2026-06-19T02:49:48] OCCT State is empty - nothing to snapshot
+[2026-06-19T07:59:53] === snapshot starting ===
+[2026-06-19T07:59:53] OCCT State is empty - nothing to snapshot
+[2026-06-19T09:42:44] === snapshot starting ===
+[2026-06-19T09:42:44] OCCT State is empty - nothing to snapshot
+[2026-06-19T09:47:21] === snapshot starting ===
+[2026-06-19T09:47:21] OCCT State is empty - nothing to snapshot
+[2026-06-20T17:33:21] === snapshot starting ===
+[2026-06-20T17:33:21] OCCT State is empty - nothing to snapshot
+[2026-06-21T02:41:50] === snapshot starting ===
+[2026-06-21T02:41:50] OCCT State is empty - nothing to snapshot

@@ -1,0 +1,11 @@
+[2026-06-13T07:27:04] occt_logger live: 429 sensors -> D:\occt_history\*_DATA
+[2026-06-13T07:28:35] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:30:09] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:31:38] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:34:34] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:41:25] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:43:26] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:44:41] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:49:06] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:49:30] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
+[2026-06-13T07:53:06] occt_logger error: [Errno 32] CreateFileW failed (err=32): C:\Users\dongk\AppData\Local\Temp\OCCT\State\sensorpoints.bin
